@@ -21,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ==========================================================
+      #  📦 INSTALL SYSTEM DEPENDENCIES
+      # ==========================================================
       - name: Install Dependencies
         run: |
           echo "=========================================="
@@ -76,6 +79,8 @@ jobs:
       #  ☁️ INSTALL CLOUDFLARED
       # ==========================================================
       - name: Install Cloudflared with Token
+        env:
+          CLOUDFLARE_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
         run: |
           echo "=========================================="
           echo "☁️ INSTALLING CLOUDFLARED"
@@ -87,15 +92,18 @@ jobs:
 
           cloudflared --version
 
-          echo "Starting Cloudflared tunnel..."
-          nohup cloudflared tunnel run --token eyJhIjoiY2FkNjFhM2UyYzk5Y2NiN2IwNTQ2MmU0MWY1N2JjNTYiLCJ0IjoiMzRlYzljNzEtYWNmZC00MzA1LTlkNjEtMzMxZGFiMGRiNTBiIiwicyI6Ik5XSXhaVFJqTlRZdFpXVm1PQzAwTnpZNExXRTBORGt0TVdFNU5UQTFPREprWVdNeSJ9 > /tmp/cloudflared.log 2>&1 &
-
-          sleep 3
-          if pgrep -f "cloudflared" > /dev/null; then
-            echo "✅ Cloudflared tunnel running"
+          if [ -z "$CLOUDFLARE_TOKEN" ]; then
+            echo "⚠️ CLOUDFLARE_TOKEN secret tidak diset, skip tunnel"
           else
-            echo "⚠️ Cloudflared gagal start, cek log:"
-            cat /tmp/cloudflared.log
+            echo "Starting Cloudflared tunnel..."
+            nohup cloudflared tunnel run --token "$CLOUDFLARE_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sleep 3
+            if pgrep -f "cloudflared" > /dev/null; then
+              echo "✅ Cloudflared tunnel running"
+            else
+              echo "⚠️ Cloudflared gagal start, cek log:"
+              cat /tmp/cloudflared.log
+            fi
           fi
 
       # ==========================================================
@@ -111,8 +119,9 @@ jobs:
           ls -la
           echo ""
 
-          # Extract .zip
           shopt -s nullglob
+
+          # Extract .zip
           for zipfile in *.zip; do
             if [ -f "$zipfile" ]; then
               echo "📦 Extracting: $zipfile"
@@ -159,6 +168,7 @@ jobs:
               echo ""
             fi
           done
+
           shopt -u nullglob
 
           echo "=========================================="
@@ -265,181 +275,138 @@ jobs:
           echo "✅ All composer dependencies installed"
 
       # ==========================================================
-      #  🚀 RUN ALL BOTS WITH CONSOLE LOG
+      #  🚀 RUN ALL BOTS (MULTI-BOT PARALEL) — TANPA PAT
       # ==========================================================
       - name: Start All Bots with Auto Restart
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_TOKEN: ${{ secrets.CLOUDFLARE_TOKEN }}
           PHP_BIN: php-cgi
         run: |
           echo "=========================================="
-          echo "🚀 STARTING ALL BOTS"
+          echo "🚀 STARTING ALL BOTS (TANPA PAT)"
           echo "=========================================="
-          echo "✅ Auto restart on crash"
-          echo "✅ Multi-bot support (semua bot dijalankan)"
-          echo "✅ Console log real-time"
-          echo "✅ Trigger new workflow tiap 6 jam (24/7)"
+          echo "✅ Multi-bot paralel (1 screen per bot)"
+          echo "✅ Auto restart on crash (per bot)"
+          echo "✅ Console log real-time per bot"
+          echo "✅ Restart via cron schedule tiap 6 jam"
           echo "✅ PHP: $(php -v | head -1)"
           echo "=========================================="
 
-          if [ -n "$GH_PAT" ]; then
-            TRIGGER_TOKEN="$GH_PAT"
-            echo "🔑 Menggunakan PAT untuk trigger workflow"
-          else
-            TRIGGER_TOKEN="$GITHUB_TOKEN"
-            echo "⚠️  PAT tidak ada, pakai GITHUB_TOKEN"
-          fi
-
-          echo "export TRIGGER_TOKEN='$TRIGGER_TOKEN'" > /tmp/token.env
-          echo "export REPO='$GITHUB_REPOSITORY'" >> /tmp/token.env
-          echo "export PHP_BIN='php-cgi'" >> /tmp/token.env
-          echo "export PATH='/usr/bin:/usr/local/bin:\$PATH'" >> /tmp/token.env
+          cat > /tmp/token.env <<EOF
+          export PHP_BIN='php-cgi'
+          export CLOUDFLARE_TOKEN='$CLOUDFLARE_TOKEN'
+          export PATH='/usr/bin:/usr/local/bin:\$PATH'
+          EOF
 
           # ==================================================
-          #  SCRIPT: START ALL BOTS
+          #  SCRIPT: FIND + START ALL BOTS (1 screen / bot)
           # ==================================================
-          cat > start_bot.sh << 'BOTEOF'
+          cat > start_all_bots.sh << 'BOTEOF'
           #!/bin/bash
-
           source /tmp/token.env
 
-          echo "Starting ALL bots with auto restart on crash..."
-          echo "PHP binary: $PHP_BIN"
-          echo ""
-
-          declare -a BOT_FILES=()
-
+          # ---------- DISCOVERY ----------
           find_all_bots() {
-            BOT_FILES=()
+            local -a BOTS=()
 
-            # 1. File .js di root
+            # --- 1. File .js di root (skip helper) ---
             shopt -s nullglob
             for f in *.js; do
-              [ -f "$f" ] || continue
+              [[ -f "$f" ]] || continue
               case "$f" in
-                start_bot.js|monitor.js|setup.js|config.js|webpack.config.js|.*) continue ;;
+                start_bot.js|start_all_bots.js|monitor.js|setup.js|config.js|webpack.config.js|.*) continue ;;
               esac
-              LINES=$(wc -l < "$f" 2>/dev/null || echo 0)
-              if [ "$LINES" -gt 5 ]; then
-                BOT_FILES+=("$f")
-              fi
-            done
-
-            # 2. Subdirectory dengan package.json atau file entry point
-            for dir in */; do
-              [ -d "$dir" ] || continue
-              case "$dir" in
-                node_modules/|.git/|vendor/|.github/) continue ;;
-              esac
-
-              if [ -f "${dir}package.json" ]; then
-                MAIN=$(jq -r '.main // empty' "${dir}package.json" 2>/dev/null)
-                if [ -n "$MAIN" ] && [ -f "${dir}${MAIN}" ]; then
-                  BOT_FILES+=("${dir}${MAIN}")
+              if [[ -f package.json ]]; then
+                MAIN=$(jq -r '.main // empty' package.json 2>/dev/null)
+                if [[ -n "$MAIN" && "$MAIN" != "$f" ]]; then
                   continue
                 fi
-                for candidate in index.js app.js main.js server.js bot.js; do
-                  if [ -f "${dir}${candidate}" ]; then
-                    BOT_FILES+=("${dir}${candidate}")
-                    break
-                  fi
-                done
-              else
-                for candidate in index.js app.js main.js server.js bot.js; do
-                  if [ -f "${dir}${candidate}" ]; then
-                    BOT_FILES+=("${dir}${candidate}")
-                    break
-                  fi
-                done
               fi
+              LINES=$(wc -l < "$f" 2>/dev/null || echo 0)
+              [[ "$LINES" -gt 5 ]] && BOTS+=("$(pwd)/$f")
             done
             shopt -u nullglob
 
-            echo "=========================================="
-            echo "📋 Found ${#BOT_FILES[@]} bot(s):"
-            echo "=========================================="
-            for bot in "${BOT_FILES[@]}"; do
-              echo "  ✔️  $bot"
-            done
-            echo "=========================================="
-            echo ""
+            # --- 2. Subdirectory rekursif (max depth 4) ---
+            while IFS= read -r pkg; do
+              local dir
+              dir=$(dirname "$pkg")
+              local main
+              main=$(jq -r '.main // empty' "$pkg" 2>/dev/null)
+              if [[ -n "$main" && -f "$dir/$main" ]]; then
+                BOTS+=("$dir/$main")
+                continue
+              fi
+              for c in index.js app.js main.js server.js bot.js start.js; do
+                if [[ -f "$dir/$c" ]]; then
+                  BOTS+=("$dir/$c")
+                  break
+                fi
+              done
+            done < <(find . -maxdepth 4 -name package.json \
+                      -not -path "*/node_modules/*" \
+                      -not -path "*/.git/*" \
+                      -not -path "*/vendor/*")
+
+            # Dedupe
+            printf '%s\n' "${BOTS[@]}" | sort -u
           }
 
-          run_single_bot() {
-            local MAIN_FILE="$1"
-            local BOT_DIR=$(dirname "$MAIN_FILE")
-            local BOT_FILE=$(basename "$MAIN_FILE")
-            local BOT_NAME="${BOT_FILE%.js}"
+          mapfile -t BOT_FILES < <(find_all_bots)
 
-            echo "🚀 [$(date '+%H:%M:%S')] Starting: $MAIN_FILE (from $BOT_DIR)"
+          echo "=========================================="
+          echo "📋 Found ${#BOT_FILES[@]} bot(s):"
+          echo "=========================================="
+          for b in "${BOT_FILES[@]}"; do
+            echo "  ✔️  $b"
+          done
+          echo "=========================================="
 
-            cd "$BOT_DIR"
-            # Console log real-time dengan prefix
-            node "$BOT_FILE" 2>&1 | stdbuf -oL -eL sed -u "s/^/[$BOT_NAME] /"
-            local EXIT_CODE=${PIPESTATUS[0]}
-            cd - > /dev/null
+          if [[ ${#BOT_FILES[@]} -eq 0 ]]; then
+            echo "❌ No bot files found!"
+            echo "Files di root:"
+            ls -la
+            exit 1
+          fi
 
-            echo "❌ [$(date '+%H:%M:%S')] $MAIN_FILE stopped (exit: $EXIT_CODE)"
-            return $EXIT_CODE
-          }
+          # ---------- START EACH BOT IN OWN SCREEN ----------
+          for BOT_PATH in "${BOT_FILES[@]}"; do
+            BOT_DIR=$(dirname "$BOT_PATH")
+            BOT_FILE=$(basename "$BOT_PATH")
 
-          run_bot_forever() {
-            local MAIN_FILE="$1"
-            local BOT_NAME=$(basename "$MAIN_FILE" .js)
+            BOT_NAME=$(echo "$BOT_DIR" | sed 's|^\./||; s|/|_|g')
+            [[ -z "$BOT_NAME" || "$BOT_NAME" == "." ]] && BOT_NAME="root"
+            SESSION="bot_${BOT_NAME}"
 
-            while true; do
-              run_single_bot "$MAIN_FILE"
-              echo "🔄 [$BOT_NAME] Restarting in 3s..."
-              sleep 3
-            done
-          }
-
-          run_all_bots() {
-            find_all_bots
-
-            if [ ${#BOT_FILES[@]} -eq 0 ]; then
-              echo "❌ No bot files found!"
-              echo "Files di root:"
-              ls -la
-              return 1
+            if screen -list | grep -q "\.${SESSION}[[:space:]]"; then
+              echo "⏭️  Session $SESSION already exists, skip"
+              continue
             fi
 
-            # Jalankan tiap bot di background dengan loop restart masing-masing
-            local PIDS=()
-            for MAIN_FILE in "${BOT_FILES[@]}"; do
-              run_bot_forever "$MAIN_FILE" &
-              PIDS+=($!)
-              echo "✅ [$(date '+%H:%M:%S')] Bot '${MAIN_FILE}' started (PID: $!)"
-            done
-
-            echo ""
-            echo "🎯 Total ${#PIDS[@]} bot(s) running in parallel"
-            echo "=========================================="
-            echo ""
-
-            # Tunggu semua proses
-            for pid in "${PIDS[@]}"; do
-              wait "$pid"
-            done
-          }
-
-          # Re-scan dan restart semua kalau ada yang mati
-          while true; do
-            run_all_bots
-            echo "⚠️ All bots exited. Re-scanning in 10s..."
-            sleep 10
+            screen -dmS "$SESSION" bash -c "
+              cd '$BOT_DIR'
+              while true; do
+                echo \"🚀 [\$(date '+%H:%M:%S')] Starting $BOT_FILE\"
+                node '$BOT_FILE' 2>&1
+                EXIT_CODE=\$?
+                echo \"❌ [\$(date '+%H:%M:%S')] $BOT_FILE exited (code: \$EXIT_CODE), restart in 5s\"
+                sleep 5
+              done
+            "
+            echo "✅ Started $BOT_FILE in screen session: $SESSION"
           done
+
+          echo ""
+          echo "🎯 ${#BOT_FILES[@]} bot(s) launched in separate screens"
           BOTEOF
 
-          chmod +x start_bot.sh
+          chmod +x start_all_bots.sh
 
           # ==================================================
           #  SCRIPT: MONITOR
           # ==================================================
           cat > monitor.sh << 'MONITOREOF'
           #!/bin/bash
-
           source /tmp/token.env
 
           echo "=========================================="
@@ -449,55 +416,56 @@ jobs:
           while true; do
             sleep 60
 
-            if ! screen -list | grep -q "bot"; then
-              echo "⚠️ [$(date)] Bot screen died! Restarting..."
-              screen -dmS bot bash start_bot.sh
-              echo "✅ Bot restarted"
-            fi
+            echo "[$(date)] 👁️  Monitor check"
+
+            bash start_all_bots.sh > /tmp/start_bots.log 2>&1
 
             if ! pgrep -f "cloudflared" > /dev/null; then
-              echo "⚠️ [$(date)] Cloudflared died! Restarting..."
-              nohup cloudflared tunnel run --token eyJhIjoiY2FkNjFhM2UyYzk5Y2NiN2IwNTQ2MmU0MWY1N2JjNTYiLCJ0IjoiMzRlYzljNzEtYWNmZC00MzA1LTlkNjEtMzMxZGFiMGRiNTBiIiwicyI6Ik5XSXhaVFJqTlRZdFpXVm1PQzAwTnpZNExXRTBORGt0TVdFNU5UQTFPREprWVdNeSJ9 > /tmp/cloudflared.log 2>&1 &
+              if [ -n "$CLOUDFLARE_TOKEN" ]; then
+                echo "⚠️ [$(date)] Cloudflared died! Restarting..."
+                nohup cloudflared tunnel run --token "$CLOUDFLARE_TOKEN" > /tmp/cloudflared.log 2>&1 &
+              fi
             fi
 
-            echo "[$(date)] ✅ Monitor check"
-            echo "   PHP: $(php -v 2>/dev/null | head -1 || echo 'not found')"
-            echo "   Node processes: $(pgrep -f node | wc -l)"
-            screen -ls || true
+            echo "   Screens:"
+            screen -ls | grep -E "bot_|monitor" || echo "   (none)"
+            echo "   Node procs : $(pgrep -f node | wc -l)"
+            echo "   PHP        : $(php -v 2>/dev/null | head -1 || echo 'not found')"
           done
           MONITOREOF
 
           chmod +x monitor.sh
 
           # ==================================================
-          #  START SCREEN SESSIONS
+          #  LAUNCH
           # ==================================================
-          echo "🖥️  Starting screen sessions..."
+          echo "🖥️  Starting all bots..."
+          bash start_all_bots.sh
 
-          screen -dmS bot bash start_bot.sh
+          echo "🖥️  Starting monitor..."
           screen -dmS monitor bash monitor.sh
 
           sleep 5
 
           echo ""
           echo "=========================================="
-          echo "✅ BOT + MONITOR RUNNING"
+          echo "✅ BOTS + MONITOR RUNNING"
           echo "=========================================="
           screen -ls
           echo ""
 
           # ==================================================
-          #  MAIN LOOP — PRINT CONSOLE LOG KE GITHUB ACTIONS
+          #  MAIN LOOP — RUNTIME 5h 50m, RESTART VIA CRON
           # ==================================================
           START_TIME=$(date +%s)
           MAX_RUNTIME=$((5 * 3600 + 50 * 60))
-          LAST_TRIGGER=0
 
-          echo "📊 Main loop started — log akan tampil di sini"
+          echo "📊 Main loop started — log tampil di sini"
+          echo "⏰ Durasi: 5h 50m, selanjutnya di-handle cron '0 */6 * * *'"
           echo "=========================================="
 
           while true; do
-            sleep 20
+            sleep 30
 
             CURRENT_TIME=$(date +%s)
             ELAPSED=$((CURRENT_TIME - START_TIME))
@@ -510,52 +478,32 @@ jobs:
             echo "   Remaining : $((REMAINING / 3600))h $(((REMAINING % 3600) / 60))m $((REMAINING % 60))s"
             echo "════════════════════════════════════════════"
 
-            # Tampilkan console log terakhir dari setiap bot (via screen hardcopy)
-            if screen -list | grep -q "bot"; then
-              echo "📺 Bot screen is ALIVE"
-              # Dump layar bot
-              screen -S bot -X hardcopy /tmp/bot_screen.log 2>/dev/null
-              if [ -f /tmp/bot_screen.log ]; then
-                echo "───── 📜 BOT CONSOLE (last 40 lines) ─────"
-                tail -40 /tmp/bot_screen.log
-                echo "──────────────────────────────────────────"
+            # Dump tiap screen bot
+            for sess in $(screen -ls | grep -oE 'bot_[a-zA-Z0-9_]+' | sort -u); do
+              screen -S "$sess" -X hardcopy "/tmp/${sess}.log" 2>/dev/null
+              if [ -f "/tmp/${sess}.log" ]; then
+                echo "───── 📜 $sess (last 15 lines) ─────"
+                tail -15 "/tmp/${sess}.log"
+                echo "──────────────────────────────────────"
               fi
-            else
-              echo "❌ Bot screen is DEAD — restarting..."
-              screen -dmS bot bash start_bot.sh
-            fi
+            done
 
-            # Restart cloudflared kalau mati
             if ! pgrep -f "cloudflared" > /dev/null; then
-              echo "⚠️ Cloudflared died! Restarting..."
-              nohup cloudflared tunnel run --token eyJhIjoiY2FkNjFhM2UyYzk5Y2NiN2IwNTQ2MmU0MWY1N2JjNTYiLCJ0IjoiMzRlYzljNzEtYWNmZC00MzA1LTlkNjEtMzMxZGFiMGRiNTBiIiwicyI6Ik5XSXhaVFJqTlRZdFpXVm1PQzAwTnpZNExXRTBORGt0TVdFNU5UQTFPREprWVdNeSJ9 > /tmp/cloudflared.log 2>&1 &
-            fi
-
-            # Trigger workflow baru di sisa 5 menit
-            if [ $REMAINING -lt 300 ] && [ $LAST_TRIGGER -eq 0 ]; then
-              echo ""
-              echo "🔄 Triggering new workflow (5 min remaining)..."
-              HTTP_CODE=$(curl -s -o /tmp/trigger_resp.json -w "%{http_code}" -X POST \
-                -H "Authorization: token $TRIGGER_TOKEN" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/$REPO/actions/workflows/bot.yml/dispatches" \
-                -d '{"ref":"main"}')
-
-              if [ "$HTTP_CODE" = "204" ]; then
-                echo "✅ New workflow triggered!"
-                LAST_TRIGGER=1
-              else
-                echo "⚠️ Trigger failed: HTTP $HTTP_CODE"
-                cat /tmp/trigger_resp.json 2>/dev/null
+              if [ -n "$CLOUDFLARE_TOKEN" ]; then
+                echo "⚠️ Cloudflared died! Restarting..."
+                nohup cloudflared tunnel run --token "$CLOUDFLARE_TOKEN" > /tmp/cloudflared.log 2>&1 &
               fi
             fi
 
             if [ $REMAINING -lt 60 ]; then
               echo ""
               echo "⏰ Time's up! Final console dump..."
-              screen -S bot -X hardcopy /tmp/bot_final.log 2>/dev/null
-              tail -100 /tmp/bot_final.log 2>/dev/null
-              echo "👋 Exiting workflow..."
+              for sess in $(screen -ls | grep -oE 'bot_[a-zA-Z0-9_]+' | sort -u); do
+                screen -S "$sess" -X hardcopy "/tmp/${sess}_final.log" 2>/dev/null
+                echo "───── 📜 FINAL: $sess ─────"
+                tail -50 "/tmp/${sess}_final.log" 2>/dev/null
+              done
+              echo "👋 Exiting. Run berikutnya akan di-trigger cron 6 jam."
               exit 0
             fi
           done
