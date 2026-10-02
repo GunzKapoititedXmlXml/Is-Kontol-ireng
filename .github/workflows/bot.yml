@@ -346,7 +346,7 @@ jobs:
                   fi
                 done
               else
-                for candidate in index.js app.js main.js server.js bot.js; do
+                for candidate in start.js app.js main.js server.js bot.js; do
                   if [ -f "${dir}${candidate}" ]; then
                     BOT_FILES+=("${dir}${candidate}")
                     break
